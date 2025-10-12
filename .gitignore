@@ -1,0 +1,5 @@
+.vscode/
+__pycache__/
+export.ps1
+project_context.txt
+*.pkl
