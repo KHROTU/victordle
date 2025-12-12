@@ -15,6 +15,7 @@ A high-performance, automated solver for the web game Victordle (Duel).
 ## Requirements
 
 - Python 3.8+
+- A `words.txt` file containing a list of 5-letter words, one per line.
 - A web browser with the [Tampermonkey](https://www.tampermonkey.net/) (or equivalent) extension.
 
 ---
@@ -23,11 +24,10 @@ A high-performance, automated solver for the web game Victordle (Duel).
 
 **1. Pre-compute the Solver Matrix (One-time step)**
 
-This step creates a `feedback_matrix.pkl` file which is essential for the solver's speed. It may take several minutes to complete depending on your CPU.
+This step reads `words.txt` and creates a `feedback_matrix.pkl` file which is essential for the solver's speed. It may take several minutes to complete depending on your CPU.
 
 ```shell
-cd wordle
-python precompute.py
+python solver.py --precompute
 ```
 
 **2. Run the Backend Server**
@@ -35,7 +35,7 @@ python precompute.py
 This server must be running in the background while you are playing the game.
 
 ```shell
-python victordle_automation.py
+python solver.py
 ```
 
 **3. Install the Userscript**

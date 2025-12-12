@@ -3,3 +3,7 @@ __pycache__/
 export.ps1
 project_context.txt
 *.pkl
+
+# Auto-added by export script
+.exportignore.json
+context.txt

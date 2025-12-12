@@ -23,7 +23,6 @@
             this.lastGuessCount = -1;
             this.setupUI();
             this.waitForBoardAndInitialize();
-            this.log("Initialized. Waiting for user to start.");
         }
 
         log(message) {
