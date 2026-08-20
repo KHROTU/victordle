@@ -6,8 +6,8 @@ A high-performance, automated solver for the web game Victordle (Duel).
 
 ## Features
 
-- **Instantaneous:** Solves puzzles almost instantly using a pre-computed backend.
-- **Optimal:** Uses a min-max algorithm to determine the best possible guess at each step.
+- **Fast:** Uses a compact, integer-encoded feedback table and cached entropy calculations.
+- **Information-based:** Ranks guesses by expected information gain while preferring valid solutions.
 - **Automated:** Automatically types guesses into the game via a userscript.
 
 ---
@@ -24,11 +24,13 @@ A high-performance, automated solver for the web game Victordle (Duel).
 
 **1. Pre-compute the Solver Matrix (One-time step)**
 
-This step reads `words.txt` and creates a `feedback_matrix.pkl` file which is essential for the solver's speed. It may take several minutes to complete depending on your CPU.
+This step reads `words.txt` and creates a compact `feedback_table.pkl` file which is essential for the solver's speed. It may take several minutes to complete depending on your CPU.
 
 ```shell
 python solver.py --precompute
 ```
+
+If `feedback_matrix.pkl` from an older version is present, the server automatically converts it to the new format on first startup.
 
 **2. Run the Backend Server**
 
@@ -52,4 +54,5 @@ python solver.py
 1. Ensure the Python server from **Setup Step 2** is running.
 2. Navigate to [Victordle (Duel)](https://www.britannica.com/games/victordle/mode-2).
 3. The solver panel will appear in the top-right corner of the page.
-4. Click **START** to begin the automated solving process.
+4. Choose a **Typing speed** in the solver panel. The setting is saved for future games.
+5. Click **START** to begin the automated solving process.

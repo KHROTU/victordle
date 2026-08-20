@@ -7,76 +7,125 @@ import pickle
 import sys
 import time
 import concurrent.futures
-from functools import partial
+from functools import lru_cache, partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, List, Tuple
 
 WORD_LENGTH = 5
 PRECOMPUTED_FIRST_GUESS = "RAISE"
 WORD_LIST_FILENAME = "words.txt"
-MATRIX_FILENAME = "feedback_matrix.pkl"
+MATRIX_FILENAME = "feedback_table.pkl"
+LEGACY_MATRIX_FILENAME = "feedback_matrix.pkl"
 SERVER_PORT = 8765
+FEEDBACK_PATTERN_COUNT = 3 ** WORD_LENGTH
+FEEDBACK_DIGITS = {'X': 0, 'Y': 1, 'G': 2}
+
+
+@lru_cache(maxsize=4)
+def entropy_contributions(max_count: int) -> Tuple[float, ...]:
+    return tuple(
+        0.0 if count < 2 else count * math.log2(count)
+        for count in range(max_count + 1)
+    )
 
 class VicSolver:
-    def __init__(self, all_words: List[str], feedback_matrix: Dict[Tuple[str, str], str]):
-        self.all_words = all_words
-        self.feedback_matrix = feedback_matrix
+    def __init__(self, all_words: List[str], feedback_matrix):
+        self.all_words = list(all_words)
+        self.word_to_index = {word: index for index, word in enumerate(self.all_words)}
+        if isinstance(feedback_matrix, dict):
+            self.feedback_rows = build_feedback_table(self.all_words, feedback_matrix)
+        else:
+            self.feedback_rows = feedback_matrix
+
+        if len(self.feedback_rows) != len(self.all_words):
+            raise ValueError("Feedback table does not match the word list.")
+        if any(len(row) != len(self.all_words) for row in self.feedback_rows):
+            raise ValueError("Feedback table contains a row with the wrong length.")
+
+        self.possible_indices = list(range(len(self.all_words)))
         self.possible_words = list(self.all_words)
+        self.possible_flags = bytearray(b'\x01') * len(self.all_words)
+        self.entropy_values = entropy_contributions(len(self.all_words))
         self.guess_count = 0
 
-    def _calculate_entropy(self, guess: str) -> float:
-        if not self.possible_words:
+    def _calculate_entropy_for_index(self, guess_index: int) -> float:
+        if not self.possible_indices:
             return 0.0
 
-        feedback_groups = collections.defaultdict(int)
-        for target_word in self.possible_words:
-            # Direct lookup is faster; safely fallback to empty string if missing
-            feedback = self.feedback_matrix.get((guess, target_word))
-            if feedback:
-                feedback_groups[feedback] += 1
-        
-        total_count = len(self.possible_words)
-        entropy = 0.0
-        
-        # Expected Information E[I] = Sum( p(x) * log2(1/p(x)) )
-        for count in feedback_groups.values():
-            p = count / total_count
-            if p > 0:
-                entropy += p * math.log2(1 / p)
+        total_count = len(self.possible_indices)
+        feedback_counts = [0] * FEEDBACK_PATTERN_COUNT
+        feedback_row = self.feedback_rows[guess_index]
+        for target_index in self.possible_indices:
+            feedback_counts[feedback_row[target_index]] += 1
 
+        entropy = math.log2(total_count)
+        for count in feedback_counts:
+            entropy -= self.entropy_values[count] / total_count
         return entropy
 
+    def _calculate_entropy(self, guess: str) -> float:
+        guess_index = self.word_to_index.get(guess)
+        if guess_index is not None:
+            return self._calculate_entropy_for_index(guess_index)
+
+        if not self.possible_indices:
+            return 0.0
+
+        feedback_groups = collections.Counter(
+            get_feedback(guess, self.all_words[target_index])
+            for target_index in self.possible_indices
+        )
+        total_count = len(self.possible_indices)
+        return sum(
+            (count / total_count) * math.log2(total_count / count)
+            for count in feedback_groups.values()
+        )
+
     def get_best_guess(self) -> str:
-        if not self.possible_words:
+        if not self.possible_indices:
             return ""
 
-        # Massive speedup for Turn 1: bypass the O(N^2) evaluation
-        if len(self.possible_words) == len(self.all_words) and PRECOMPUTED_FIRST_GUESS in self.all_words:
+        if len(self.possible_indices) == len(self.all_words) and PRECOMPUTED_FIRST_GUESS in self.word_to_index:
             return PRECOMPUTED_FIRST_GUESS
 
-        # End-game optimization: just pick one to win if only 1 or 2 options remain
-        if len(self.possible_words) <= 2:
-            return self.possible_words[0]
+        if len(self.possible_indices) <= 2:
+            return self.all_words[self.possible_indices[0]]
 
-        def score_key(guess: str) -> Tuple[float, bool]:
-            entropy = self._calculate_entropy(guess)
-            is_possible = guess in self.possible_words
-            # Priority 1: Maximize Information Gain
-            # Priority 2: Prefer words that could actually be the solution (tie-breaker)
+        def score_key(guess_index: int) -> Tuple[float, bool]:
+            entropy = self._calculate_entropy_for_index(guess_index)
+            is_possible = self.possible_flags[guess_index]
             return (entropy, is_possible)
 
-        # Single-threaded max() is optimal here due to Python's GIL limits on CPU-bound loops.
-        # Once possible_words is reduced after Turn 1, this evaluates very rapidly.
-        return max(self.all_words, key=score_key)
+        best_guess_index = max(range(len(self.all_words)), key=score_key)
+        return self.all_words[best_guess_index]
 
     def apply_feedback(self, guess: str, feedback: str):
         if len(guess) != WORD_LENGTH or len(feedback) != WORD_LENGTH:
             return
 
-        self.possible_words = [
-            word for word in self.possible_words
-            if self.feedback_matrix.get((guess, word)) == feedback
-        ]
+        guess = guess.upper()
+        feedback = feedback.upper()
+        feedback_code = encode_feedback(feedback)
+        guess_index = self.word_to_index.get(guess)
+
+        if guess_index is None:
+            self.possible_indices = [
+                target_index
+                for target_index in self.possible_indices
+                if get_feedback(guess, self.all_words[target_index]) == feedback
+            ]
+        else:
+            feedback_row = self.feedback_rows[guess_index]
+            self.possible_indices = [
+                target_index
+                for target_index in self.possible_indices
+                if feedback_row[target_index] == feedback_code
+            ]
+
+        self.possible_words = [self.all_words[index] for index in self.possible_indices]
+        self.possible_flags = bytearray(len(self.all_words))
+        for target_index in self.possible_indices:
+            self.possible_flags[target_index] = 1
         self.guess_count += 1
 
     def get_status(self) -> dict:
@@ -109,8 +158,82 @@ def get_feedback(guess: str, target: str) -> str:
     
     return "".join(feedback)
 
-def compute_row_for_guess(guess: str, all_words: Tuple[str, ...]) -> Dict[Tuple[str, str], str]:
-    return {(guess, target): get_feedback(guess, target) for target in all_words}
+
+def encode_feedback(feedback: str) -> int:
+    if len(feedback) != WORD_LENGTH:
+        raise ValueError(f"Feedback must contain {WORD_LENGTH} symbols.")
+
+    code = 0
+    for symbol in feedback:
+        try:
+            digit = FEEDBACK_DIGITS[symbol]
+        except KeyError as error:
+            raise ValueError(f"Invalid feedback pattern: {feedback}") from error
+        code = code * 3 + digit
+    return code
+
+
+def get_feedback_code(guess: str, target: str) -> int:
+    target_counts = [0] * 26
+    for character in target:
+        target_counts[ord(character) - ord('A')] += 1
+
+    feedback_digits = [0] * WORD_LENGTH
+    for index in range(WORD_LENGTH):
+        if guess[index] == target[index]:
+            feedback_digits[index] = 2
+            target_counts[ord(guess[index]) - ord('A')] -= 1
+
+    for index in range(WORD_LENGTH):
+        if feedback_digits[index] == 2:
+            continue
+        character_index = ord(guess[index]) - ord('A')
+        if target_counts[character_index] > 0:
+            feedback_digits[index] = 1
+            target_counts[character_index] -= 1
+
+    code = 0
+    for digit in feedback_digits:
+        code = code * 3 + digit
+    return code
+
+
+def compute_row_for_guess(guess: str, all_words: Tuple[str, ...]) -> bytes:
+    return bytes(get_feedback_code(guess, target) for target in all_words)
+
+
+def build_feedback_table(all_words: List[str], feedback_matrix: Dict[Tuple[str, str], str]):
+    rows = []
+    for guess in all_words:
+        row = bytearray(len(all_words))
+        for target_index, target in enumerate(all_words):
+            feedback = feedback_matrix.get((guess, target))
+            if feedback is None:
+                raise ValueError(f"Missing feedback for {guess} vs {target}.")
+            row[target_index] = encode_feedback(feedback)
+        rows.append(bytes(row))
+    return tuple(rows)
+
+
+def save_feedback_table(filename: str, all_words: List[str], feedback_table) -> None:
+    payload = {
+        'version': 2,
+        'words': tuple(all_words),
+        'rows': tuple(feedback_table),
+    }
+    with open(filename, 'wb') as file:
+        pickle.dump(payload, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_feedback_table(filename: str, all_words: List[str]):
+    with open(filename, 'rb') as file:
+        payload = pickle.load(file)
+
+    if not isinstance(payload, dict) or payload.get('version') != 2:
+        raise ValueError(f"Unsupported feedback table format in '{filename}'.")
+    if tuple(all_words) != tuple(payload.get('words', ())):
+        raise ValueError("Feedback table was generated from a different word list.")
+    return tuple(payload['rows'])
 
 def load_words(filename: str) -> List[str]:
     if not os.path.exists(filename):
@@ -150,7 +273,7 @@ def precompute_and_save():
     print("This may take several minutes...")
 
     start_time = time.time()
-    feedback_matrix = {}
+    feedback_table = []
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         worker_func = partial(compute_row_for_guess, all_words=tuple(all_words))
@@ -158,7 +281,7 @@ def precompute_and_save():
         results_iterator = executor.map(worker_func, all_words, chunksize=chunksize)
         
         for i, row_dict in enumerate(results_iterator):
-            feedback_matrix.update(row_dict)
+            feedback_table.append(row_dict)
             progress = (i + 1) / num_words
             elapsed_time = time.time() - start_time
             sys.stdout.write(
@@ -170,10 +293,9 @@ def precompute_and_save():
     total_time = time.time() - start_time
     print(f"\n\nComputation complete in {total_time:.2f} seconds.")
 
-    print(f"Saving matrix to '{MATRIX_FILENAME}'...")
+    print(f"Saving feedback table to '{MATRIX_FILENAME}'...")
     try:
-        with open(MATRIX_FILENAME, 'wb') as f:
-            pickle.dump(feedback_matrix, f, protocol=pickle.HIGHEST_PROTOCOL)
+        save_feedback_table(MATRIX_FILENAME, all_words, feedback_table)
         file_size = os.path.getsize(MATRIX_FILENAME) / (1024 * 1024)
         print(f"Successfully saved. File size: {file_size:.2f} MB")
     except Exception as e:
@@ -189,17 +311,26 @@ def load_data_for_server():
     ALL_WORDS = load_words(WORD_LIST_FILENAME)
     
     try:
-        with open(MATRIX_FILENAME, 'rb') as f:
-            FEEDBACK_MATRIX = pickle.load(f)
+        if os.path.exists(MATRIX_FILENAME):
+            FEEDBACK_MATRIX = load_feedback_table(MATRIX_FILENAME, ALL_WORDS)
+        elif os.path.exists(LEGACY_MATRIX_FILENAME):
+            print(f"Converting legacy matrix '{LEGACY_MATRIX_FILENAME}'...")
+            with open(LEGACY_MATRIX_FILENAME, 'rb') as file:
+                legacy_matrix = pickle.load(file)
+            FEEDBACK_MATRIX = build_feedback_table(ALL_WORDS, legacy_matrix)
+            save_feedback_table(MATRIX_FILENAME, ALL_WORDS, FEEDBACK_MATRIX)
+            print(f"Converted matrix saved as '{MATRIX_FILENAME}'.")
+        else:
+            raise FileNotFoundError(MATRIX_FILENAME)
     except FileNotFoundError:
-        print(f"FATAL: Could not find matrix '{MATRIX_FILENAME}'.", file=sys.stderr)
-        print("Please run 'python vic_server.py --precompute' first.", file=sys.stderr)
+        print(f"FATAL: Could not find feedback table '{MATRIX_FILENAME}'.", file=sys.stderr)
+        print("Please run 'python solver.py --precompute' first.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"FATAL: Could not load matrix '{MATRIX_FILENAME}'. Error: {e}", file=sys.stderr)
+        print(f"FATAL: Could not load feedback table '{MATRIX_FILENAME}'. Error: {e}", file=sys.stderr)
         sys.exit(1)
     
-    print(f"Data loaded: {len(ALL_WORDS)} words and {len(FEEDBACK_MATRIX)} matrix entries.")
+    print(f"Data loaded: {len(ALL_WORDS)} words and {len(FEEDBACK_MATRIX)} feedback rows.")
 
 class SolverHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -253,7 +384,6 @@ class SolverHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        # Suppress noisy HTTP logs, keep stdout clean for game state
         pass
 
 def start_server():

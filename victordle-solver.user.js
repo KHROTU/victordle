@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Victordle Auto Guesser
 // @namespace    http://tampermonkey.net/
-// @version      1.5.1
-// @description  Automates Victordle (Duel) using Entropy-based solving and supports a continuous Manual Mode.
+// @version      1.5.2
+// @description  Automates Victordle (Duel) using Entropy-based solving, configurable typing speed, and Manual Mode.
 // @author       KHROTU
 // @match        https://www.britannica.com/games/victordle/mode-2
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=https://www.britannica.com/games/victordle/mode-2
@@ -15,6 +15,9 @@
 
     const PYTHON_SERVER_URL = 'http://localhost:8765';
     const FIRST_GUESS = 'ARISE';
+    const SPEED_STORAGE_KEY = 'victordle-solver-typing-delay';
+    const SPEED_OPTIONS = [10, 40, 100, 200];
+    const DEFAULT_TYPING_DELAY = 10;
 
     class VictordleGuesser {
         constructor() {
@@ -58,6 +61,19 @@
                     <label for="manual-mode-chk" style="cursor: pointer; font-size: 13px; color: #fff; user-select: none;">Manual Mode (Hints Only)</label>
                 </div>
 
+                <div style="margin-bottom: 15px; background: #444; padding: 8px; border-radius: 4px;">
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                        <label for="typing-speed" style="font-size: 13px; color: #fff;">Typing speed</label>
+                        <span id="typing-speed-value" style="font-size: 12px; color: #bdc3c7;"></span>
+                    </div>
+                    <select id="typing-speed" style="width: 100%; padding: 5px; border: 1px solid #666; border-radius: 3px; background: #333; color: #fff; cursor: pointer;">
+                        <option value="10">Fast</option>
+                        <option value="40">Normal</option>
+                        <option value="100">Slow</option>
+                        <option value="200">Very slow</option>
+                    </select>
+                </div>
+
                 <button id="toggle-guesser" style="width: 100%; padding: 12px; font-size: 14px; font-weight: bold; cursor: pointer; border: none; border-radius: 4px; background-color: #2ecc71; color: white; transition: background 0.2s;">
                     START AUTO-BOT
                 </button>
@@ -78,10 +94,23 @@
             this.toggleBtn = document.getElementById('toggle-guesser');
             this.debugInfoEl = document.getElementById('guesser-debug-info');
             this.manualModeChk = document.getElementById('manual-mode-chk');
+            this.typingSpeedSelect = document.getElementById('typing-speed');
+            this.typingSpeedValue = document.getElementById('typing-speed-value');
             this.suggestionsBox = document.getElementById('solver-suggestions');
             this.suggestionList = document.getElementById('suggestion-list');
 
+            this.typingDelay = this.loadTypingDelay();
+            this.typingSpeedSelect.value = String(this.typingDelay);
+            this.updateTypingSpeedLabel();
+
             this.toggleBtn.addEventListener('click', () => this.toggleActive());
+
+            this.typingSpeedSelect.addEventListener('change', () => {
+                this.typingDelay = Number(this.typingSpeedSelect.value);
+                this.saveTypingDelay();
+                this.updateTypingSpeedLabel();
+                this.log(`Typing speed changed: ${this.typingDelay}ms per key.`);
+            });
             
             this.manualModeChk.addEventListener('change', () => {
                 const isManual = this.manualModeChk.checked;
@@ -101,6 +130,28 @@
             });
 
             this.updateDebugInfo({ status: "Panel initialized." });
+        }
+
+        loadTypingDelay() {
+            try {
+                const savedDelay = Number(localStorage.getItem(SPEED_STORAGE_KEY));
+                if (SPEED_OPTIONS.includes(savedDelay)) return savedDelay;
+            } catch (error) {
+                this.log(`Could not load typing speed: ${error.message}`);
+            }
+            return DEFAULT_TYPING_DELAY;
+        }
+
+        saveTypingDelay() {
+            try {
+                localStorage.setItem(SPEED_STORAGE_KEY, String(this.typingDelay));
+            } catch (error) {
+                this.log(`Could not save typing speed: ${error.message}`);
+            }
+        }
+
+        updateTypingSpeedLabel() {
+            this.typingSpeedValue.textContent = `${this.typingDelay} ms/key`;
         }
 
         waitForBoardAndInitialize() {
@@ -286,11 +337,12 @@
 
         async typeWord(word) {
             this.log(`Typing: ${word}`);
+            const typingDelay = this.typingDelay;
             for (const char of word) {
                 this.simulateKeyPress(char.toLowerCase());
-                await new Promise(resolve => setTimeout(resolve, 10));
+                await new Promise(resolve => setTimeout(resolve, typingDelay));
             }
-            await new Promise(resolve => setTimeout(resolve, 25));
+            await new Promise(resolve => setTimeout(resolve, Math.max(25, typingDelay * 2)));
             this.simulateKeyPress('Enter');
             this.updateStatus("Waiting for feedback...");
         }
