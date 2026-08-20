@@ -1,16 +1,18 @@
 import argparse
 import collections
-import concurrent.futures
 import json
+import math
 import os
 import pickle
 import sys
 import time
+import concurrent.futures
 from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Dict, List, Tuple
 
 WORD_LENGTH = 5
+PRECOMPUTED_FIRST_GUESS = "RAISE"
 WORD_LIST_FILENAME = "words.txt"
 MATRIX_FILENAME = "feedback_matrix.pkl"
 SERVER_PORT = 8765
@@ -22,37 +24,50 @@ class VicSolver:
         self.possible_words = list(self.all_words)
         self.guess_count = 0
 
-    def _calculate_guess_score(self, guess: str) -> int:
+    def _calculate_entropy(self, guess: str) -> float:
         if not self.possible_words:
-            return 0
+            return 0.0
 
         feedback_groups = collections.defaultdict(int)
         for target_word in self.possible_words:
-            feedback = self.feedback_matrix.get((guess, target_word), "")
-            feedback_groups[feedback] += 1
+            # Direct lookup is faster; safely fallback to empty string if missing
+            feedback = self.feedback_matrix.get((guess, target_word))
+            if feedback:
+                feedback_groups[feedback] += 1
+        
+        total_count = len(self.possible_words)
+        entropy = 0.0
+        
+        # Expected Information E[I] = Sum( p(x) * log2(1/p(x)) )
+        for count in feedback_groups.values():
+            p = count / total_count
+            if p > 0:
+                entropy += p * math.log2(1 / p)
 
-        return max(feedback_groups.values()) if feedback_groups else 0
+        return entropy
 
     def get_best_guess(self) -> str:
         if not self.possible_words:
             return ""
 
+        # Massive speedup for Turn 1: bypass the O(N^2) evaluation
+        if len(self.possible_words) == len(self.all_words) and PRECOMPUTED_FIRST_GUESS in self.all_words:
+            return PRECOMPUTED_FIRST_GUESS
+
+        # End-game optimization: just pick one to win if only 1 or 2 options remain
         if len(self.possible_words) <= 2:
             return self.possible_words[0]
 
-        best_candidate = (float('inf'), True, "")
-
-        for guess in self.all_words:
-            score = self._calculate_guess_score(guess)
+        def score_key(guess: str) -> Tuple[float, bool]:
+            entropy = self._calculate_entropy(guess)
             is_possible = guess in self.possible_words
-            candidate = (score, not is_possible, guess)
+            # Priority 1: Maximize Information Gain
+            # Priority 2: Prefer words that could actually be the solution (tie-breaker)
+            return (entropy, is_possible)
 
-            if candidate < best_candidate:
-                best_candidate = candidate
-                if best_candidate[0] == 1 and not best_candidate[1]:
-                    return best_candidate[2]
-
-        return best_candidate[2]
+        # Single-threaded max() is optimal here due to Python's GIL limits on CPU-bound loops.
+        # Once possible_words is reduced after Turn 1, this evaluates very rapidly.
+        return max(self.all_words, key=score_key)
 
     def apply_feedback(self, guess: str, feedback: str):
         if len(guess) != WORD_LENGTH or len(feedback) != WORD_LENGTH:
@@ -178,7 +193,7 @@ def load_data_for_server():
             FEEDBACK_MATRIX = pickle.load(f)
     except FileNotFoundError:
         print(f"FATAL: Could not find matrix '{MATRIX_FILENAME}'.", file=sys.stderr)
-        print("Please run 'python solver.py --precompute' first.", file=sys.stderr)
+        print("Please run 'python vic_server.py --precompute' first.", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
         print(f"FATAL: Could not load matrix '{MATRIX_FILENAME}'. Error: {e}", file=sys.stderr)
@@ -189,7 +204,7 @@ def load_data_for_server():
 class SolverHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
-            content_length = int(self.headers['Content-Length'])
+            content_length = int(self.headers.get('Content-Length', 0))
             post_data = self.rfile.read(content_length)
             data = json.loads(post_data.decode('utf-8'))
         except (TypeError, json.JSONDecodeError):
@@ -203,6 +218,7 @@ class SolverHTTPHandler(BaseHTTPRequestHandler):
             guesses = data.get('guesses', [])
             print(f"\n[Request] Received board state: {guesses}")
 
+            start_time = time.time()
             solver = VicSolver(ALL_WORDS, FEEDBACK_MATRIX)
             for guess_data in guesses:
                 word = guess_data.get('word', '').upper()
@@ -211,11 +227,14 @@ class SolverHTTPHandler(BaseHTTPRequestHandler):
 
             print(f"[Solver] {len(solver.possible_words)} possible words remain.")
             status = solver.get_status()
-            print(f"[Solver] Best guess: '{status['next_guess']}'")
+            elapsed_time = time.time() - start_time
+            
+            print(f"[Solver] Best guess: '{status['next_guess']}' (calculated in {elapsed_time:.3f}s)")
             
             response = {
                 "next_guess": status['next_guess'],
-                "possible_words_count": status['possible_words_count']
+                "possible_words_count": status['possible_words_count'],
+                "options": status['options']
             }
         else:
             response = {"error": "Invalid action"}
@@ -234,7 +253,8 @@ class SolverHTTPHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, format, *args):
-        return
+        # Suppress noisy HTTP logs, keep stdout clean for game state
+        pass
 
 def start_server():
     try:

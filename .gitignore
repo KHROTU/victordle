@@ -6,4 +6,6 @@ project_context.txt
 
 # Auto-added by export script
 .exportignore.json
+.export.state.json
 context.txt
+build.json
